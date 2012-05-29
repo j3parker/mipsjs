@@ -29,6 +29,7 @@ function MIPS(ramsize) {
       opBLTZAL = 0x10;
   var opADD     = 0x20,
       opADDU    = 0x21,
+      opALLOCAI = 0x14,
       opAND     = 0x24,
       opDIV     = 0x1A,
       opDIVU    = 0x1B,
@@ -51,7 +52,8 @@ function MIPS(ramsize) {
       opXOR     = 0x26;
   var opPUTC    = 0x01, // custom opcodes
       opRET     = 0x05,
-      opCALL    = 0x12;
+      opCALL    = 0x12,
+      opHALT    = 0x15;
   var regSP = 29,
       regFP = 30,
       regLR = 31;
@@ -139,7 +141,7 @@ function MIPS(ramsize) {
         // Load/store
         /^[ \t]*([a-z]+)[ \t]* \$([0-9]+)[ \t]*,[ \t]*(-?[_a-zA-Z0-9]+)[ \t]*\([ \t]*\$([0-9]+)[ \t]*\)$/,
         // Label
-        /^[ \t]*([a-zA-Z]+[_a-zA-Z0-9]*):$/,
+        /^[ \t]*([_a-zA-Z]+[_a-zA-Z0-9]*):$/,
         // .word macro
         /^[ \t]*(\.word)[ \t]* (-?[_a-zA-Z0-9]+)[ \t]*$/,
         // .string macro
@@ -258,6 +260,10 @@ function MIPS(ramsize) {
           assert_type(inst, type3R);
           output.push(asm_r(opADDU, +inst[2], +inst[3], +inst[4]));
           break;
+        case "allocai":
+          assert_type(inst, type1I);
+          output.push(asm_r(opALLOCAI, 0, +inst[2]));
+          break;
         case "and":
           assert_type(inst, type3R);
           output.push(asm_r(opAND, +inst[2], +inst[3], +inst[4]));
@@ -273,6 +279,10 @@ function MIPS(ramsize) {
         case "divu":
           assert_type(inst, type2R);
           output.push(asm_r(opDIVU, 0, +inst[2], +inst[3]));
+          break;
+        case "halt":
+          assert_type(inst, type0R);
+          output.push(asm_r(opHALT));
           break;
         case "jalr":
           assert_type(inst, type2R);
@@ -527,11 +537,14 @@ function MIPS(ramsize) {
   MIPS.program_ram = function(loc, op) {
     vm.RAM[loc] = op;
     vm.RAMState[loc] = RAM_CODE;
+
+    // TODO: do this stuff better
+    vm.regs[regSP] = loc*4 + 4;
+    vm.regs[regFP] = vm.regs[regSP];
   }
 
-  MIPS.run = function(n) {
-    var dirty = { ram: new Array(), reg: [] },
-        oldpc = vm.pc,
+  MIPS.run = function() {
+    var oldpc = vm.pc,
         data,
         loc,
         write_mem,
@@ -547,26 +560,20 @@ function MIPS(ramsize) {
     function target(x) { return (x&0x3FFFFFF); }
     //function opcode(x) { return (x&0xFC000000)>>>26; }
     function funct(x)  { return (x&0x3F); }
-    for(i = 0; i < n; i += 1) {
+    while(1) {
       if(vm.config.faultOnPCEscape && !(vm.RAMState[vm.pc] & RAM_CODE)) {
         throw {
-                PC: vm.pc,
                 message: "PC at non-code location.",
-                fatal: true
         };
       }
       if(vm.config.faultOnUnallocR && (vm.RAMState[vm.pc] & RAM_UNALLOC)) {
         throw {
-                PC: vm.pc,
                 message: "Attempted to load instruction from unallocated memory.",
-                fatal: true
         };
       }
       if(vm.pc >= vm.RAM.length) {
         throw {
-                PC: vm.pc,
                 message: "Attmpted to load code from non-existant memory at location " + loc.toString(16) + ".",
-                fatal: true
         };
       }
       write_mem = false;
@@ -583,12 +590,17 @@ function MIPS(ramsize) {
           switch(funct(instr)) {
             case opADD:
             case opADDU: vm.regs[rdx] = vm.regs[rsx] + vm.regs[rtx]; break;
+            case opALLOCAI:
+              vm.regs[regSP] += rsx*4;
+              break;
             case opAND: vm.regs[rdx] = vm.regs[rsx] & vm.regs[rtx]; break;
             case opDIV:
             case opDIVU:
               vm.lo = Math.floor(vm.regs[rsx] / vm.regs[rtx]) & 0xFFFFFFFF;
               vm.hi = Math.floor(vm.regs[rsx] % vm.regs[rtx]) & 0xFFFFFFFF;
               break;
+            case opHALT:
+              return;
             case opJR: vm.pc = vm.regs[rsx] - 1; break;
             case opMFHI: vm.regs[rdx] = vm.hi; break;
             case opMFLO: vm.regs[rdx] = vm.lo; break;
@@ -612,17 +624,17 @@ function MIPS(ramsize) {
             case opRET:
               vm.pc = vm.regs[regLR] - 1;
               var oldfp = vm.regs[regFP];
+              if(oldfp %4 !== 0) throw { message: "On ret, unaligned stack pointer." };
+              oldfp /= 4;
               var retval = vm.regs[rsx];
               for(var i = 6; i < 32; i++) {
                 if(vm.RAMState[oldfp - i + 5] !== RAM_STACK) {
                   throw {
                     message: "Bad stack pointer on ret.",
-                    fatal: true
                   };
                 }
                 vm.regs[32 - i + 5] = vm.RAM[oldfp - i + 5];
                 vm.RAMState[oldfp - i + 5] = RAM_UNALLOC;
-                dirty.ram.push(oldfp - i + 5);
               }
               vm.regs[1] = retval;
               break;
@@ -640,7 +652,9 @@ function MIPS(ramsize) {
               vm.regs[rdx] =
                 tc32_to_untyped(vm.regs[rsx]) - tc32_to_untyped(vm.regs[rtx]);
               break;
-            case opSUBU: vm.regs[rdx] = vm.regs[rsx] - vm.regs[rtx]; break;
+            case opSUBU: vm.regs[rdx] = vm.regs[rsx] - vm.regs[rtx];
+              console.log('what');
+              break;
             case opSYSCALL:
               /* assume exception handler at 0x80 */
               vm.pc = 0x80/4 - 1;
@@ -648,10 +662,7 @@ function MIPS(ramsize) {
             case opXOR: vm.regs[rdx] = vm.regs[rsx] ^ vm.regs[rtx]; break;
             default:
               throw {
-                PC: vm.pc,
-                op: instr,
-                message: "Invalid function code for arithmetic operation.",
-                fatal: true
+                message: "Invalid function code for arithmetic operation: " + funct(instr),
               };
           }
           break;
@@ -662,9 +673,7 @@ function MIPS(ramsize) {
             case opBLTZ: if(tc32_to_untyped(vm.regs[rsx]) < 0) { vm.pc += immx; } break;
             case opBLTZAL: if(tc32_to_untyped(vm.regs[rsx]) < 0) { vm.regs[31] = vm.pc; vm.pc += immx; } break;
             default: throw {
-                       PC: vm.pc,
                        message: "Invalid branch-like opcode.",
-                       fatal: true
                      };
           }
           break;
@@ -679,18 +688,19 @@ function MIPS(ramsize) {
           var newLR = vm.pc + 1;
           vm.pc = (vm.pc & 0xF0000000) | target(instr)/4;
           for(var i = 6; i < 32; i++) {
-            var loc = vm.regs[regSP] + i - 6;
+            if(vm.regs[regSP] % 4 !== 0) {
+              throw { message: "On call, unaligned stack pointer." };
+            }
+            var loc = vm.regs[regSP]/4 + i - 6;
             if(vm.RAMState[loc] !== RAM_UNALLOC) {
               throw {
                 message: "On call, invalid stack pointer.",
-                fatal: true
               };
             }
             vm.RAM[loc] = vm.regs[i];
             vm.RAMState[loc] = RAM_STACK;
-            dirty.ram.push(loc);
           }
-          vm.regs[regSP] += 26;
+          vm.regs[regSP] += 26*4;
           vm.regs[regFP] = vm.regs[regSP];
           vm.regs[regLR] = newLR;
           break;
@@ -714,78 +724,60 @@ function MIPS(ramsize) {
           loc = vm.regs[rsx] + immx;
           if(loc%4 !== 0) {
             throw {
-              PC: vm.pc,
               message: "Unaligned word read.",
-              fatal: true
             };
           }
-          if(loc/4 >= vm.RAM.length) {
+          loc /= 4;
+          if(loc >= vm.RAM.length) {
             throw {
-              PC: vm.pc,
               message: "Attmpted to read from non-existant memory at location " + loc.toString(16) + ".",
-              fatal: true
             };
           }
-          vm.regs[rtx] = vm.RAM[loc/4];
+          vm.regs[rtx] = vm.RAM[loc];
           break;
         case opORI:
         case opSB:
         case opSLTI:
         case opSLTIU:
         case opSW:
-          offset = immx;
-          if(offset%4 !== 0) {
+          loc = vm.regs[rsx] + immx;
+          if(loc%4 !== 0) {
             throw {
-              PC: vm.pc,
               message: "Unaligned word store.",
-              fatal: true
             };
           }
-          loc = vm.regs[rsx] + offset/4;
+          loc /= 4;
           data = vm.regs[rtx];
           write_mem = true;
           break;
         case opXORI: break;
         default:
           throw {
-            PC: vm.pc,
             message: "Invalid opcode: " + opcode(instr).toString(16) + ".",
-            fatal: true
           };
       }
-      dirty.ram.push(oldpc);
-      dirty.ram.push(vm.pc);
       if(write_mem) {
         if(loc >= VM_DEVICE_START) {
           handle_io(loc, data);
         } else if(loc >= vm.RAM.length) {
           throw {
-            PC: vm.pc,
             message: "Attmpted to write to non-existant memory at location " + loc.toString(16) + ".",
-            fatal: true
           };
         } else if(vm.RAMState[loc] & RAM_UNALLOC && vm.config.faultOnUnallocW) {
           throw {
-            PC: vm.pc,
             message: "Attempted write to unallocated memory",
-            fatal: true
           };
         } else if(vm.RAMState[loc] & RAM_CODE && vm.config.faultOnCodeW) {
           throw {
-            PC: vm.pc,
             message: "Attempted write to protected code location.",
-            fatal: true
           };
         } else {
           if((vm.RAMState[loc] & RAM_UNALLOC) && vm.config.heapAllocOnUnallocW) { vm.RAMState[loc] = RAM_HEAP; }
           vm.RAM[loc] = data;
-          dirty.ram.push(loc);
         }
       }
       vm.regs[0] = 0;
-      dirty.reg = [rsx, rtx, rdx];
     }
-    return dirty;
   }
 
   function handle_io(loc, data) {
@@ -793,9 +785,7 @@ function MIPS(ramsize) {
       case VM_CONSOLE_CHAR_OUT:
         if(typeof vm.console === "undefined") {
           throw {
-            PC: vm.pc,
             message: "No console attached.",
-            fatal: true,
           };
         }
         vm.console.putc(String.fromCharCode(data));
@@ -803,30 +793,35 @@ function MIPS(ramsize) {
       case VM_CONSOLE_CHAR_IN :
         if(typeof vm.console === "undefined") {
           throw {
-            PC: vm.pc,
             message: "No console attached.",
-            fatal: true,
           };
         }
         vm.console.getc();
         break;
       default:
         throw {
-          PC: vm.pc,
           message: "Attempted write to incorrect device register.",
-          fatal: true,
         };
     }
   }
 
+  MIPS.reset = function() {
+    vm.regs = new Uint32Array(32);
+    vm.pc = 0;
+    vm.hi = 0;
+    vm.lo = 0;
+    vm.RAM = new Uint32Array(ramsize);
+    vm.RAMState = new Uint8Array(ramsize);
+    for(var i = 0; i < ramsize; i += 1) {
+      vm.RAMState[i] = RAM_UNALLOC;
+    }
+  }
+
   var i = 0;
-  vm = { regs: new Uint32Array(32),
-         pc: 0,
-         hi: 0,
-         lo: 0,
-         RAM: new Uint32Array(ramsize),
-         RAMState: new Uint8Array(ramsize),
-         config: {
+  vm = new Object();
+  MIPS.reset();
+  vm.config =
+         {
            faultOnCodeW:        true,
            faultOnCodeR:        true,
            faultOnUnallocR:     true,
@@ -834,10 +829,8 @@ function MIPS(ramsize) {
            faultOnUninitR:      true,
            faultOnPCEscape:     true,
            heapAllocOnUnallocW: true
-         }
-       };
-  for(i = 0; i < ramsize; i += 1) {
-    vm.RAMState[i] = RAM_UNALLOC;
-  }
+         };
+
+  MIPS.vm = vm;
   return MIPS;
 }
